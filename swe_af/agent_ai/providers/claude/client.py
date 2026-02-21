@@ -19,6 +19,7 @@ from claude_agent_sdk import (
     ResultMessage as _ResultMessage,
     query as _query,
 )
+from claude_agent_sdk._errors import MessageParseError as _MessageParseError
 
 from swe_af.agent_ai.providers.claude.adapter import convert_content_block
 from swe_af.agent_ai.types import (
@@ -201,7 +202,9 @@ class ClaudeProviderClient:
         effective_model = model or cfg.model
         effective_cwd = str(cwd or cfg.cwd)
         effective_turns = max_turns or cfg.max_turns
-        effective_tools = allowed_tools if allowed_tools is not None else list(cfg.allowed_tools)
+        effective_tools = (
+            allowed_tools if allowed_tools is not None else list(cfg.allowed_tools)
+        )
         effective_retries = max_retries if max_retries is not None else cfg.max_retries
         effective_env = {**cfg.env, **(env or {})}
         effective_system = system_prompt or cfg.system_prompt
@@ -292,7 +295,13 @@ class ClaudeProviderClient:
         last_exc: Exception | None = None
 
         if log_fh:
-            _write_log(log_fh, "start", prompt=prompt, model=options.model, max_turns=options.max_turns)
+            _write_log(
+                log_fh,
+                "start",
+                prompt=prompt,
+                model=options.model,
+                max_turns=options.max_turns,
+            )
 
         for attempt in range(effective_retries + 1):
             try:
@@ -329,7 +338,9 @@ class ClaudeProviderClient:
                     return resp
 
                 if log_fh:
-                    _write_log(log_fh, "backup_start", reason="structured output parse failed")
+                    _write_log(
+                        log_fh, "backup_start", reason="structured output parse failed"
+                    )
 
                 backup_log_file = f"{log_fh.name}_backup" if log_fh else None
                 backup_log_fh = _open_log(backup_log_file)
@@ -368,7 +379,12 @@ class ClaudeProviderClient:
                     return resp
 
                 if log_fh:
-                    _write_log(log_fh, "end", is_error=True, reason="schema parse failed after backup")
+                    _write_log(
+                        log_fh,
+                        "end",
+                        is_error=True,
+                        reason="schema parse failed after backup",
+                    )
                 return AgentResponse(
                     result=response.result,
                     parsed=None,
@@ -397,11 +413,21 @@ class ClaudeProviderClient:
                     if output_schema:
                         output_path = _schema_output_path(effective_cwd)
                         temp_files.append(output_path)
-                        schema_json = json.dumps(output_schema.model_json_schema(), indent=2)
-                        final_prompt = prompt + _build_schema_suffix(output_path, schema_json)
+                        schema_json = json.dumps(
+                            output_schema.model_json_schema(), indent=2
+                        )
+                        final_prompt = prompt + _build_schema_suffix(
+                            output_path, schema_json
+                        )
                     continue
                 if log_fh:
-                    _write_log(log_fh, "end", is_error=True, error=str(e), stderr=_captured_stderr or None)
+                    _write_log(
+                        log_fh,
+                        "end",
+                        is_error=True,
+                        error=str(e),
+                        stderr=_captured_stderr or None,
+                    )
                 raise
 
         raise last_exc  # type: ignore[misc]
@@ -451,7 +477,13 @@ class ClaudeProviderClient:
         options = ClaudeAgentOptions(**opts_kwargs)
 
         if log_fh:
-            _write_log(log_fh, "start", prompt="[backup schema agent]", model=model, max_turns=5)
+            _write_log(
+                log_fh,
+                "start",
+                prompt="[backup schema agent]",
+                model=model,
+                max_turns=5,
+            )
 
         try:
             async for msg in _query(prompt=backup_prompt, options=options):
@@ -471,6 +503,29 @@ class ClaudeProviderClient:
 
         return _read_and_parse_json_file(output_path, output_schema)
 
+    async def _safe_query(
+        self,
+        prompt: str,
+        options: ClaudeAgentOptions,
+        *,
+        log_fh: IO[str] | None = None,
+    ):
+        """Wrap _query to gracefully handle unknown message types (e.g. rate_limit_event).
+
+        The claude_agent_sdk (<=0.1.39) raises MessageParseError for message
+        types it doesn't recognise.  Claude Code CLI emits ``rate_limit_event``
+        during streaming back-pressure; we log it and continue instead of
+        crashing the entire build.
+        """
+        try:
+            async for msg in _query(prompt=prompt, options=options):
+                yield msg
+        except _MessageParseError as exc:
+            # Log the unknown message but don't crash — the query has already
+            # ended so we just return what we collected so far.
+            if log_fh:
+                _write_log(log_fh, "sdk_parse_error", error=str(exc))
+
     async def _execute(
         self,
         prompt: str,
@@ -484,7 +539,7 @@ class ClaudeProviderClient:
         metrics_data: dict[str, Any] = {}
         turn = 0
 
-        async for msg in _query(prompt=prompt, options=options):
+        async for msg in self._safe_query(prompt, options, log_fh=log_fh):
             if isinstance(msg, _AssistantMessage):
                 turn += 1
                 content = [convert_content_block(b) for b in (msg.content or [])]
@@ -525,13 +580,17 @@ class ClaudeProviderClient:
                         duration_ms=msg.duration_ms,
                     )
 
-        metrics = Metrics(**metrics_data) if metrics_data else Metrics(
-            duration_ms=0,
-            duration_api_ms=0,
-            num_turns=0,
-            total_cost_usd=None,
-            usage=None,
-            session_id="",
+        metrics = (
+            Metrics(**metrics_data)
+            if metrics_data
+            else Metrics(
+                duration_ms=0,
+                duration_api_ms=0,
+                num_turns=0,
+                total_cost_usd=None,
+                usage=None,
+                session_id="",
+            )
         )
 
         is_error = metrics_data.get("is_error", False) if metrics_data else False
