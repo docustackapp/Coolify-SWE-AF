@@ -17,6 +17,7 @@ services:
       - PORT=8003
       - AGENT_CALLBACK_URL=http://swe-agent:8003
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - CLAUDE_CODE_USE_OAUTH=1
       - GH_TOKEN=${GH_TOKEN}
     volumes:
       - workspaces:/workspaces
