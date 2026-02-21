@@ -19,7 +19,23 @@ from claude_agent_sdk import (
     ResultMessage as _ResultMessage,
     query as _query,
 )
-from claude_agent_sdk._errors import MessageParseError as _MessageParseError
+from claude_agent_sdk._errors import MessageParseError as _MessageParseError  # noqa: F401
+
+import claude_agent_sdk._internal.message_parser as _mp
+import claude_agent_sdk._internal.client as _cl
+
+_original_parse = _mp.parse_message
+
+
+def _patched_parse(data):
+    msg_type = data.get("type", "") if isinstance(data, dict) else ""
+    if msg_type == "rate_limit_event":
+        return None
+    return _original_parse(data)
+
+
+_mp.parse_message = _patched_parse
+_cl.parse_message = _patched_parse
 
 from swe_af.agent_ai.providers.claude.adapter import convert_content_block
 from swe_af.agent_ai.types import (
@@ -503,29 +519,6 @@ class ClaudeProviderClient:
 
         return _read_and_parse_json_file(output_path, output_schema)
 
-    async def _safe_query(
-        self,
-        prompt: str,
-        options: ClaudeAgentOptions,
-        *,
-        log_fh: IO[str] | None = None,
-    ):
-        """Wrap _query to gracefully handle unknown message types (e.g. rate_limit_event).
-
-        The claude_agent_sdk (<=0.1.39) raises MessageParseError for message
-        types it doesn't recognise.  Claude Code CLI emits ``rate_limit_event``
-        during streaming back-pressure; we log it and continue instead of
-        crashing the entire build.
-        """
-        try:
-            async for msg in _query(prompt=prompt, options=options):
-                yield msg
-        except _MessageParseError as exc:
-            # Log the unknown message but don't crash — the query has already
-            # ended so we just return what we collected so far.
-            if log_fh:
-                _write_log(log_fh, "sdk_parse_error", error=str(exc))
-
     async def _execute(
         self,
         prompt: str,
@@ -539,7 +532,9 @@ class ClaudeProviderClient:
         metrics_data: dict[str, Any] = {}
         turn = 0
 
-        async for msg in self._safe_query(prompt, options, log_fh=log_fh):
+        async for msg in _query(prompt=prompt, options=options):
+            if msg is None:
+                continue
             if isinstance(msg, _AssistantMessage):
                 turn += 1
                 content = [convert_content_block(b) for b in (msg.content or [])]
